@@ -1,9 +1,10 @@
-from typing import List
+from datetime import datetime, timedelta, timezone
+from typing import List, Dict, Any
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.models import Chat, Repo, Subscription
+from app.models import Chat, Repo, Subscription, EventLog
 
 
 def get_or_create_chat(db: Session, telegram_chat_id: int, title: str | None = None) -> Chat:
@@ -15,6 +16,8 @@ def get_or_create_chat(db: Session, telegram_chat_id: int, title: str | None = N
         if title and chat.title != title:
             chat.title = title
             db.add(chat)
+            db.commit()
+            db.refresh(chat)
         return chat
 
     chat = Chat(
@@ -80,31 +83,6 @@ def subscribe_chat_to_repo(db: Session, chat: Chat, repo: Repo) -> Subscription:
     return sub
 
 
-def get_chats_for_repo_full_name(db: Session, full_name: str) -> List[Chat]:
-    repo = db.execute(
-        select(Repo).where(Repo.full_name == full_name)
-    ).scalar_one_or_none()
-
-    if not repo:
-        return []
-
-    subs = db.execute(
-        select(Subscription).where(
-            Subscription.repo_id == repo.id,
-            Subscription.is_active.is_(True),
-        )
-    ).scalars().all()
-
-    chats = [sub.chat for sub in subs]
-    print(
-        "DEBUG: chats for repo",
-        full_name,
-        "->",
-        [(c.id, c.telegram_chat_id, c.title) for c in chats]
-    )
-    return chats
-
-
 def get_subscriptions_for_chat(db: Session, chat: Chat) -> list[Subscription]:
     subs = db.execute(
         select(Subscription).where(
@@ -139,3 +117,138 @@ def unsubscribe_chat_from_repo(db: Session, chat: Chat, full_name: str) -> bool:
     db.commit()
     db.refresh(sub)
     return True
+
+
+def get_subscriptions_for_repo_full_name(db: Session, full_name: str) -> list[Subscription]:
+    full_name = full_name.strip()
+    repo = db.execute(
+        select(Repo).where(Repo.full_name == full_name)
+    ).scalar_one_or_none()
+
+    if not repo:
+        return []
+
+    subs = db.execute(
+        select(Subscription).where(
+            Subscription.repo_id == repo.id,
+            Subscription.is_active.is_(True),
+        )
+    ).scalars().all()
+    return subs
+
+
+def set_branches_for_subscription(
+    db: Session,
+    chat: Chat,
+    full_name: str,
+    branches: str,
+) -> bool:
+    full_name = full_name.strip()
+    repo = db.execute(
+        select(Repo).where(Repo.full_name == full_name)
+    ).scalar_one_or_none()
+
+    if not repo:
+        return False
+
+    sub = db.execute(
+        select(Subscription).where(
+            Subscription.chat_id == chat.id,
+            Subscription.repo_id == repo.id,
+        )
+    ).scalar_one_or_none()
+
+    if not sub:
+        return False
+
+    sub.branches = branches.strip()
+    db.add(sub)
+    db.commit()
+    db.refresh(sub)
+    return True
+
+def branch_matches(branch: str, branches_filter: str | None) -> bool:
+    if not branches_filter:
+        return True
+
+    branch = branch.strip()
+    patterns = [p.strip() for p in branches_filter.split(",") if p.strip()]
+
+    if not patterns:
+        return True
+
+    for pattern in patterns:
+        if pattern.endswith("/*"):
+            prefix = pattern[:-2]
+            if branch.startswith(prefix + "/"):
+                return True
+        else:
+            if branch == pattern:
+                return True
+
+    return False
+
+
+def log_event(
+    db: Session,
+    *,
+    chat: Chat,
+    repo: Repo,
+    event_type: str,
+    event_subtype: str | None,
+    payload_summary: str | None,
+    ts: datetime | None = None,
+) -> None:
+    if ts is None:
+        ts = datetime.now(timezone.utc)
+
+    log = EventLog(
+        chat_id=chat.id,
+        repo_id=repo.id,
+        event_type=event_type,
+        event_subtype=event_subtype,
+        timestamp=ts,
+        payload_summary=payload_summary,
+    )
+    db.add(log)
+    db.commit()
+
+
+def get_daily_digest_for_chat_summaries(
+    db: Session,
+    chat: Chat,
+    hours: int = 24,
+) -> list[Dict[str, Any]]:
+    since = datetime.now(timezone.utc) - timedelta(hours=hours)
+
+    stmt = (
+        select(
+            EventLog.timestamp,
+            EventLog.event_type,
+            EventLog.event_subtype,
+            EventLog.payload_summary,
+            Repo.full_name,
+        )
+        .join(Repo, EventLog.repo_id == Repo.id)
+        .where(
+            EventLog.chat_id == chat.id,
+            EventLog.timestamp >= since,
+        )
+        .order_by(EventLog.timestamp.asc())
+    )
+
+    rows = db.execute(stmt).all()
+
+    result: list[Dict[str, Any]] = []
+    for ts, event_type, event_subtype, payload_summary, full_name in rows:
+        result.append(
+            {
+                "timestamp": ts,
+                "event_type": event_type,
+                "event_subtype": event_subtype,
+                "payload_summary": payload_summary,
+                "repo_full_name": full_name,
+            }
+        )
+
+    return result

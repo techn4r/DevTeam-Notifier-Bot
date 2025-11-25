@@ -1,6 +1,7 @@
 import hashlib
 import hmac
 import json
+from typing import Any
 
 from fastapi import APIRouter, Header, HTTPException, Request, status
 
@@ -37,9 +38,10 @@ async def github_webhook(
     request: Request,
     x_github_event: str = Header(..., alias="X-GitHub-Event"),
     x_hub_signature_256: str | None = Header(
-        default=None, alias="X-Hub-Signature-256"
+        default=None,
+        alias="X-Hub-Signature-256",
     ),
-):
+) -> dict[str, Any]:
     raw_body = await request.body()
 
     verify_signature(x_hub_signature_256, raw_body)
@@ -54,6 +56,10 @@ async def github_webhook(
 
     if x_github_event == "pull_request":
         await handle_pull_request_event(payload)
+    elif x_github_event == "push":
+        await handle_push_event(payload)
+    elif x_github_event == "workflow_run":
+        await handle_workflow_run_event(payload)
 
     return {"ok": True}
 
@@ -71,8 +77,7 @@ async def handle_pull_request_event(payload: dict) -> None:
     user = (pr.get("user") or {}).get("login", "unknown")
     base_ref = (pr.get("base") or {}).get("ref", "?")
     head_ref = (pr.get("head") or {}).get("ref", "?")
-    repo_full_name = repo.get("full_name", None)
-
+    repo_full_name = repo.get("full_name")
     if not repo_full_name:
         return
 
@@ -87,12 +92,16 @@ async def handle_pull_request_event(payload: dict) -> None:
         if merged:
             status_emoji = "🟪"
             status_text = "PR влит (merged)"
+            action_subtype = "merged"
         else:
             status_emoji = "🟥"
             status_text = "PR закрыт"
+            action_subtype = "closed"
+    if action in {"opened", "reopened"}:
+        action_subtype = action
 
     text = (
-        f"{status_emoji} {status_text}\n"
+        f"{status_emoji} <b>{status_text}</b>\n"
         f"📦 Репозиторий: <code>{repo_full_name}</code>\n"
         f"👤 Автор: <code>{user}</code>\n"
         f"🔀 {head_ref} → {base_ref}\n"
@@ -102,15 +111,192 @@ async def handle_pull_request_event(payload: dict) -> None:
     if url:
         text += f"\n🔗 {url}"
 
-    with SessionLocal() as db:
-        chats = crud.get_chats_for_repo_full_name(db, repo_full_name)
+    branch = base_ref or ""
 
-    if not chats:
+    chat_ids: list[int] = []
+
+    with SessionLocal() as db:
+        subs = crud.get_subscriptions_for_repo_full_name(db, repo_full_name)
+
+        for sub in subs:
+            if not crud.branch_matches(branch, sub.branches):
+                continue
+
+            chat = sub.chat
+            repo_obj = sub.repo
+
+            chat_ids.append(chat.telegram_chat_id)
+
+            summary = f"PR {action_subtype}: {title}"
+            crud.log_event(
+                db,
+                chat=chat,
+                repo=repo_obj,
+                event_type="pull_request",
+                event_subtype=action_subtype,
+                payload_summary=summary,
+            )
+
+    if not chat_ids:
         return
 
-    for chat in chats:
+    for chat_id in chat_ids:
         await bot.send_message(
-            chat_id=chat.telegram_chat_id,
+            chat_id=chat_id,
+            text=text,
+            disable_web_page_preview=True,
+        )
+
+
+async def handle_push_event(payload: dict) -> None:
+    repo = payload.get("repository") or {}
+    repo_full_name = repo.get("full_name")
+    if not repo_full_name:
+        return
+
+    ref = payload.get("ref", "")
+    branch = ref.split("/", 2)[-1] if ref.startswith("refs/") else ref
+
+    pusher = (payload.get("pusher") or {}).get("name", "unknown")
+    forced = payload.get("forced", False)
+    commits = payload.get("commits") or []
+    commit_count = len(commits)
+
+    commit_lines: list[str] = []
+    for c in commits[:5]:
+        sha = (c.get("id") or "")[:7]
+        msg = (c.get("message") or "").split("\n", 1)[0]
+        author = (c.get("author") or {}).get("name", "unknown")
+        commit_lines.append(f"- <code>{sha}</code> {msg} ({author})")
+
+    if commit_count == 0:
+        summary_text = "без новых коммитов 🤔"
+    elif commit_count == 1:
+        summary_text = "1 новый коммит"
+    else:
+        summary_text = f"{commit_count} новых коммитов"
+
+    text = (
+        "📤 <b>Push в репозиторий</b>\n"
+        f"📦 <code>{repo_full_name}</code>\n"
+        f"🌿 Ветка: <code>{branch}</code>\n"
+        f"👤 Pusher: <code>{pusher}</code>\n"
+        f"📊 {summary_text}\n"
+    )
+
+    if forced:
+        text += "⚠️ Force push\n"
+
+    if commit_lines:
+        text += "\n" + "\n".join(commit_lines)
+
+    chat_ids: list[int] = []
+
+    with SessionLocal() as db:
+        subs = crud.get_subscriptions_for_repo_full_name(db, repo_full_name)
+
+        for sub in subs:
+            if not crud.branch_matches(branch, sub.branches):
+                continue
+
+            chat = sub.chat
+            repo_obj = sub.repo
+
+            chat_ids.append(chat.telegram_chat_id)
+
+            summary = f"push {branch}: {summary_text}"
+            crud.log_event(
+                db,
+                chat=chat,
+                repo=repo_obj,
+                event_type="push",
+                event_subtype=branch,
+                payload_summary=summary,
+            )
+
+    if not chat_ids:
+        return
+
+    for chat_id in chat_ids:
+        await bot.send_message(
+            chat_id=chat_id,
+            text=text,
+            disable_web_page_preview=True,
+        )
+
+
+async def handle_workflow_run_event(payload: dict) -> None:
+    repo = payload.get("repository") or {}
+    repo_full_name = repo.get("full_name")
+    if not repo_full_name:
+        return
+
+    workflow_run = payload.get("workflow_run") or {}
+    name = workflow_run.get("name", "Workflow")
+    status = workflow_run.get("status", "unknown")
+    conclusion = workflow_run.get("conclusion")
+    url = workflow_run.get("html_url", "")
+    branch = workflow_run.get("head_branch", "?")
+    head_commit = workflow_run.get("head_commit") or {}
+    sha = (head_commit.get("id") or "")[:7]
+    message = (head_commit.get("message") or "").split("\n", 1)[0]
+    author = (head_commit.get("author") or {}).get("name", "unknown")
+
+    if status != "completed":
+        emoji = "⏳"
+        status_text = status
+        subtype = status
+    else:
+        if conclusion == "success":
+            emoji = "✅"
+        elif conclusion in {"failure", "timed_out", "cancelled"}:
+            emoji = "❌"
+        else:
+            emoji = "❔"
+        status_text = conclusion or "completed"
+        subtype = conclusion or "completed"
+
+    text = (
+        f"{emoji} <b>GitHub Actions: {name}</b>\n"
+        f"📦 <code>{repo_full_name}</code>\n"
+        f"🌿 Ветка: <code>{branch}</code>\n"
+        f"📌 Статус: <code>{status_text}</code>\n"
+        f"👤 Commit: <code>{sha}</code> — {message} ({author})\n"
+    )
+
+    if url:
+        text += f"\n🔗 {url}"
+
+    chat_ids: list[int] = []
+
+    with SessionLocal() as db:
+        subs = crud.get_subscriptions_for_repo_full_name(db, repo_full_name)
+
+        for sub in subs:
+            if not crud.branch_matches(branch, sub.branches):
+                continue
+
+            chat = sub.chat
+            repo_obj = sub.repo
+
+            chat_ids.append(chat.telegram_chat_id)
+
+            summary = f"CI {name}: {status_text} ({branch})"
+            crud.log_event(
+                db,
+                chat=chat,
+                repo=repo_obj,
+                event_type="workflow_run",
+                event_subtype=subtype,
+                payload_summary=summary,
+            )
+
+    if not chat_ids:
+        return
+
+    for chat_id in chat_ids:
+        await bot.send_message(
+            chat_id=chat_id,
             text=text,
             disable_web_page_preview=True,
         )

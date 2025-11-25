@@ -1,4 +1,15 @@
-from sqlalchemy import BigInteger, Boolean, Column, ForeignKey, Integer, String
+from datetime import datetime, timezone
+
+from sqlalchemy import (
+    BigInteger,
+    Boolean,
+    Column,
+    DateTime,
+    ForeignKey,
+    Integer,
+    String,
+    Text,
+)
 from sqlalchemy.orm import relationship
 
 from app.db import Base
@@ -48,3 +59,26 @@ class Subscription(Base):
 
     def __repr__(self) -> str:
         return f"<Subscription chat_id={self.chat_id} repo_id={self.repo_id}>"
+
+
+class EventLog(Base):
+    __tablename__ = "event_logs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    chat_id = Column(Integer, ForeignKey("chats.id"), nullable=False)
+    repo_id = Column(Integer, ForeignKey("repos.id"), nullable=False)
+
+    event_type = Column(String, nullable=False)
+    event_subtype = Column(String, nullable=True)
+    timestamp = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+    payload_summary = Column(Text, nullable=True)
+
+    chat = relationship("Chat")
+    repo = relationship("Repo")
+
+    def __repr__(self) -> str:
+        return f"<EventLog chat_id={self.chat_id} repo_id={self.repo_id} type={self.event_type}>"
