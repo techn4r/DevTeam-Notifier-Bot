@@ -7,9 +7,11 @@ router = Router()
 
 @router.message(CommandStart())
 async def cmd_start(message: Message):
+    chat_id = message.chat.id
     await message.answer(
         "Привет! Я DevTeam Notifier Bot.\n"
-        "Пока что я умею только /ping, но скоро начну слать уведомления о PR и CI."
+        "Пока что я умею /ping и принимаю вебхуки от GitHub.\n\n"
+        f"Твой chat_id: {chat_id}\n"
     )
 
 

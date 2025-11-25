@@ -1,11 +1,12 @@
 import asyncio
 
-from aiogram import Bot, Dispatcher
-from fastapi import FastAPI
 import uvicorn
+from fastapi import FastAPI
 
-from app.config import TELEGRAM_BOT_TOKEN, APP_HOST, APP_PORT
+from app.config import APP_HOST, APP_PORT
+from app.bot_instance import bot, dp
 from bot.handlers import router as bot_router
+from integrations.github.router import router as github_router
 
 
 def create_fastapi_app() -> FastAPI:
@@ -15,14 +16,12 @@ def create_fastapi_app() -> FastAPI:
     async def health():
         return {"status": "ok"}
 
+    app.include_router(github_router)
     return app
 
 
 async def run_bot():
-    bot = Bot(token=TELEGRAM_BOT_TOKEN)
-    dp = Dispatcher()
     dp.include_router(bot_router)
-
     await dp.start_polling(bot)
 
 
