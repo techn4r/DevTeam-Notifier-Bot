@@ -4,7 +4,7 @@ from typing import List, Dict, Any
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.models import Chat, Repo, Subscription, EventLog
+from app.models import Chat, Repo, Subscription, EventLog, PRThread
 
 
 def get_or_create_chat(db: Session, telegram_chat_id: int, title: str | None = None) -> Chat:
@@ -252,3 +252,52 @@ def get_daily_digest_for_chat_summaries(
         )
 
     return result
+
+
+def save_pr_thread_for_ids(
+    db: Session,
+    chat_db_id: int,
+    repo_db_id: int,
+    pr_number: int,
+    root_message_id: int,
+) -> None:
+    thread = db.execute(
+        select(PRThread).where(
+            PRThread.chat_id == chat_db_id,
+            PRThread.repo_id == repo_db_id,
+            PRThread.pr_number == pr_number,
+        )
+    ).scalar_one_or_none()
+
+    if thread:
+        thread.root_message_id = root_message_id
+        db.add(thread)
+    else:
+        thread = PRThread(
+            chat_id=chat_db_id,
+            repo_id=repo_db_id,
+            pr_number=pr_number,
+            root_message_id=root_message_id,
+        )
+        db.add(thread)
+
+    db.commit()
+
+
+def get_pr_thread_root_message_id(
+    db: Session,
+    chat_db_id: int,
+    repo_db_id: int,
+    pr_number: int,
+) -> int | None:
+    thread = db.execute(
+        select(PRThread).where(
+            PRThread.chat_id == chat_db_id,
+            PRThread.repo_id == repo_db_id,
+            PRThread.pr_number == pr_number,
+        )
+    ).scalar_one_or_none()
+
+    if not thread:
+        return None
+    return thread.root_message_id

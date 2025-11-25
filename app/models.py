@@ -82,3 +82,27 @@ class EventLog(Base):
 
     def __repr__(self) -> str:
         return f"<EventLog chat_id={self.chat_id} repo_id={self.repo_id} type={self.event_type}>"
+
+
+class PRThread(Base):
+    __tablename__ = "pr_threads"
+
+    id = Column(Integer, primary_key=True, index=True)
+    chat_id = Column(Integer, ForeignKey("chats.id"), nullable=False)
+    repo_id = Column(Integer, ForeignKey("repos.id"), nullable=False)
+    pr_number = Column(Integer, nullable=False)
+    root_message_id = Column(Integer, nullable=False)
+    created_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+
+    chat = relationship("Chat")
+    repo = relationship("Repo")
+
+    def __repr__(self) -> str:
+        return (
+            f"<PRThread chat_id={self.chat_id} repo_id={self.repo_id} "
+            f"pr={self.pr_number} msg={self.root_message_id}>"
+        )

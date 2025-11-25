@@ -4,7 +4,7 @@ import json
 from typing import Any
 
 from fastapi import APIRouter, Header, HTTPException, Request, status
-
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from app.bot_instance import bot
 from app.config import GITHUB_WEBHOOK_SECRET
 from app.db import SessionLocal
@@ -77,6 +77,7 @@ async def handle_pull_request_event(payload: dict) -> None:
     user = (pr.get("user") or {}).get("login", "unknown")
     base_ref = (pr.get("base") or {}).get("ref", "?")
     head_ref = (pr.get("head") or {}).get("ref", "?")
+    pr_number = pr.get("number")
     repo_full_name = repo.get("full_name")
     if not repo_full_name:
         return
@@ -84,9 +85,11 @@ async def handle_pull_request_event(payload: dict) -> None:
     if action == "opened":
         status_emoji = "🟦"
         status_text = "Открыт новый PR"
+        action_subtype = "opened"
     elif action == "reopened":
         status_emoji = "🟩"
         status_text = "Переоткрыт PR"
+        action_subtype = "reopened"
     else:
         merged = pr.get("merged", False)
         if merged:
@@ -97,8 +100,6 @@ async def handle_pull_request_event(payload: dict) -> None:
             status_emoji = "🟥"
             status_text = "PR закрыт"
             action_subtype = "closed"
-    if action in {"opened", "reopened"}:
-        action_subtype = action
 
     text = (
         f"{status_emoji} <b>{status_text}</b>\n"
@@ -111,9 +112,31 @@ async def handle_pull_request_event(payload: dict) -> None:
     if url:
         text += f"\n🔗 {url}"
 
+    buttons: list[InlineKeyboardButton] = []
+    if url:
+        buttons.append(
+            InlineKeyboardButton(
+                text="🔍 Открыть PR",
+                url=url,
+            )
+        )
+
+    if repo_full_name:
+        repo_url = f"https://github.com/{repo_full_name}"
+        buttons.append(
+            InlineKeyboardButton(
+                text="📦 Репозиторий",
+                url=repo_url,
+            )
+        )
+
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[buttons] if buttons else []
+    )
+
     branch = base_ref or ""
 
-    chat_ids: list[int] = []
+    targets: list[dict[str, int]] = []
 
     with SessionLocal() as db:
         subs = crud.get_subscriptions_for_repo_full_name(db, repo_full_name)
@@ -125,7 +148,13 @@ async def handle_pull_request_event(payload: dict) -> None:
             chat = sub.chat
             repo_obj = sub.repo
 
-            chat_ids.append(chat.telegram_chat_id)
+            targets.append(
+                {
+                    "chat_tg_id": chat.telegram_chat_id,
+                    "chat_db_id": chat.id,
+                    "repo_db_id": repo_obj.id,
+                }
+            )
 
             summary = f"PR {action_subtype}: {title}"
             crud.log_event(
@@ -137,15 +166,39 @@ async def handle_pull_request_event(payload: dict) -> None:
                 payload_summary=summary,
             )
 
-    if not chat_ids:
+    if not targets:
         return
 
-    for chat_id in chat_ids:
-        await bot.send_message(
-            chat_id=chat_id,
+    for t in targets:
+        reply_to: int | None = None
+        if pr_number is not None and action in {"reopened", "closed"}:
+            with SessionLocal() as db:
+                root_id = crud.get_pr_thread_root_message_id(
+                    db,
+                    chat_db_id=t["chat_db_id"],
+                    repo_db_id=t["repo_db_id"],
+                    pr_number=pr_number,
+                )
+            if root_id:
+                reply_to = root_id
+
+        msg = await bot.send_message(
+            chat_id=t["chat_tg_id"],
             text=text,
             disable_web_page_preview=True,
+            reply_markup=keyboard,
+            reply_to_message_id=reply_to,
         )
+
+        if pr_number is not None and action in {"opened", "reopened"} and not reply_to:
+            with SessionLocal() as db:
+                crud.save_pr_thread_for_ids(
+                    db,
+                    chat_db_id=t["chat_db_id"],
+                    repo_db_id=t["repo_db_id"],
+                    pr_number=pr_number,
+                    root_message_id=msg.message_id,
+                )
 
 
 async def handle_push_event(payload: dict) -> None:
@@ -190,7 +243,21 @@ async def handle_push_event(payload: dict) -> None:
     if commit_lines:
         text += "\n" + "\n".join(commit_lines)
 
-    chat_ids: list[int] = []
+    buttons: list[InlineKeyboardButton] = []
+    if repo_full_name:
+        repo_url = f"https://github.com/{repo_full_name}"
+        buttons.append(
+            InlineKeyboardButton(
+                text="📦 Репозиторий",
+                url=repo_url,
+            )
+        )
+
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[buttons] if buttons else []
+    )
+
+    targets: list[dict[str, int]] = []
 
     with SessionLocal() as db:
         subs = crud.get_subscriptions_for_repo_full_name(db, repo_full_name)
@@ -202,7 +269,13 @@ async def handle_push_event(payload: dict) -> None:
             chat = sub.chat
             repo_obj = sub.repo
 
-            chat_ids.append(chat.telegram_chat_id)
+            targets.append(
+                {
+                    "chat_tg_id": chat.telegram_chat_id,
+                    "chat_db_id": chat.id,
+                    "repo_db_id": repo_obj.id,
+                }
+            )
 
             summary = f"push {branch}: {summary_text}"
             crud.log_event(
@@ -214,14 +287,15 @@ async def handle_push_event(payload: dict) -> None:
                 payload_summary=summary,
             )
 
-    if not chat_ids:
+    if not targets:
         return
 
-    for chat_id in chat_ids:
+    for t in targets:
         await bot.send_message(
-            chat_id=chat_id,
+            chat_id=t["chat_tg_id"],
             text=text,
             disable_web_page_preview=True,
+            reply_markup=keyboard,
         )
 
 
@@ -267,7 +341,28 @@ async def handle_workflow_run_event(payload: dict) -> None:
     if url:
         text += f"\n🔗 {url}"
 
-    chat_ids: list[int] = []
+    buttons: list[InlineKeyboardButton] = []
+    if url:
+        buttons.append(
+            InlineKeyboardButton(
+                text="🚀 Открыть run",
+                url=url,
+            )
+        )
+    if repo_full_name:
+        repo_url = f"https://github.com/{repo_full_name}"
+        buttons.append(
+            InlineKeyboardButton(
+                text="📦 Репозиторий",
+                url=repo_url,
+            )
+        )
+
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[buttons] if buttons else []
+    )
+
+    targets: list[dict[str, int]] = []
 
     with SessionLocal() as db:
         subs = crud.get_subscriptions_for_repo_full_name(db, repo_full_name)
@@ -279,7 +374,13 @@ async def handle_workflow_run_event(payload: dict) -> None:
             chat = sub.chat
             repo_obj = sub.repo
 
-            chat_ids.append(chat.telegram_chat_id)
+            targets.append(
+                {
+                    "chat_tg_id": chat.telegram_chat_id,
+                    "chat_db_id": chat.id,
+                    "repo_db_id": repo_obj.id,
+                }
+            )
 
             summary = f"CI {name}: {status_text} ({branch})"
             crud.log_event(
@@ -291,12 +392,13 @@ async def handle_workflow_run_event(payload: dict) -> None:
                 payload_summary=summary,
             )
 
-    if not chat_ids:
+    if not targets:
         return
 
-    for chat_id in chat_ids:
+    for t in targets:
         await bot.send_message(
-            chat_id=chat_id,
+            chat_id=t["chat_tg_id"],
             text=text,
             disable_web_page_preview=True,
+            reply_markup=keyboard,
         )
