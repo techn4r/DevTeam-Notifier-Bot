@@ -5,6 +5,7 @@ from fastapi import FastAPI
 
 from app.config import APP_HOST, APP_PORT
 from app.bot_instance import bot, dp
+from app.db import init_db
 from bot.handlers import router as bot_router
 from integrations.github.router import router as github_router
 
@@ -17,6 +18,7 @@ def create_fastapi_app() -> FastAPI:
         return {"status": "ok"}
 
     app.include_router(github_router)
+
     return app
 
 
@@ -32,7 +34,7 @@ async def run_api():
     await server.serve()
 
 
-async def main():
+async def async_main():
     await asyncio.gather(
         run_bot(),
         run_api(),
@@ -40,4 +42,5 @@ async def main():
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    init_db()
+    asyncio.run(async_main())

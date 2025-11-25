@@ -5,7 +5,9 @@ import json
 from fastapi import APIRouter, Header, HTTPException, Request, status
 
 from app.bot_instance import bot
-from app.config import DEFAULT_CHAT_ID, GITHUB_WEBHOOK_SECRET
+from app.config import GITHUB_WEBHOOK_SECRET
+from app.db import SessionLocal
+from app import crud
 
 router = APIRouter(prefix="/webhook/github", tags=["github"])
 
@@ -57,9 +59,6 @@ async def github_webhook(
 
 
 async def handle_pull_request_event(payload: dict) -> None:
-    if not DEFAULT_CHAT_ID:
-        return
-
     action = payload.get("action")
     pr = payload.get("pull_request") or {}
     repo = payload.get("repository") or {}
@@ -72,7 +71,10 @@ async def handle_pull_request_event(payload: dict) -> None:
     user = (pr.get("user") or {}).get("login", "unknown")
     base_ref = (pr.get("base") or {}).get("ref", "?")
     head_ref = (pr.get("head") or {}).get("ref", "?")
-    repo_full_name = repo.get("full_name", "unknown/repo")
+    repo_full_name = repo.get("full_name", None)
+
+    if not repo_full_name:
+        return
 
     if action == "opened":
         status_emoji = "🟦"
@@ -100,8 +102,15 @@ async def handle_pull_request_event(payload: dict) -> None:
     if url:
         text += f"\n🔗 {url}"
 
-    await bot.send_message(
-        chat_id=int(DEFAULT_CHAT_ID),
-        text=text,
-        disable_web_page_preview=True,
-    )
+    with SessionLocal() as db:
+        chats = crud.get_chats_for_repo_full_name(db, repo_full_name)
+
+    if not chats:
+        return
+
+    for chat in chats:
+        await bot.send_message(
+            chat_id=chat.telegram_chat_id,
+            text=text,
+            disable_web_page_preview=True,
+        )
